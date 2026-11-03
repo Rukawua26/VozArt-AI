@@ -1,793 +1,1136 @@
-import React, { useEffect, useRef, useState, useCallback } from 'react';
+import { useEffect, useRef, useState, useCallback, MutableRefObject } from 'react';
 import * as fabric from 'fabric';
-import { 
-  Pencil, 
-  Paintbrush, 
-  Highlighter, 
-  Eraser, 
-  Square, 
-  Circle, 
-  Triangle, 
-  Star, 
-  Trash2, 
-  Undo2, 
-  Redo2, 
-  Download, 
-  Layers, 
-  Eye, 
-  EyeOff, 
-  Sparkles,
-  Sliders,
-  Maximize2,
-  Save,
-  Clock
-} from 'lucide-react';
-import { cn } from '../lib/utils';
-import { ToolType, LayerState, AccessibilitySettings } from '../types/art';
-import { useCanvasPersistence } from '../hooks/useCanvasPersistence';
-import { RestoreWorkBanner } from './RestoreWorkBanner';
+import { Trash2, Undo2, Redo2, Download, Move, Blend } from 'lucide-react';
+import { cn, withAlpha } from '../lib/utils';
+import type { AccessibilitySettings, AppCommand, Layer, WorkProfile } from '../types';
+import { createCustomBrush, setPointerProps, CustomBrushType } from './customBrushes';
+import { ToolType, BrushType, BlendMode, TOOLS, MAX_HISTORY, MAX_HISTORY_SIZE_BYTES, STORAGE_KEY, COLOR_SWATCHES, BLEND_MODES, profileHint } from '../lib/canvas-constants';
+import { makeShape, makeCanvasBackground, getImagePlacement, downloadFile, LayerAwareObject } from '../lib/canvas-utils';
+import { dispatchAIAction } from '../lib/ai-dispatcher';
 
-interface CanvasProps {
-  commands: any[];
-  onActionFeedback?: (message: string) => void;
-  accessibility: AccessibilitySettings;
+interface CanvasApi {
+  exportPNG: () => void;
+  reassignObjectLayer: (objectId: string, toLayerId: string) => void;
+  loadJSON: (json?: string | null) => void;
+  getObjectList: () => string[];
+  getSelectedObjectInfo: () => string;
 }
 
-export const CanvasInclusivo: React.FC<CanvasProps> = ({ 
-  commands, 
-  onActionFeedback,
-  accessibility 
-}) => {
+interface CanvasProps {
+  commands: AppCommand[];
+  canvasApiRef: MutableRefObject<CanvasApi | null>;
+  layers: Layer[];
+  activeLayerId: string;
+  onToggleLayer: (id: string) => void;
+  accessibility: AccessibilitySettings;
+  workProfile: WorkProfile;
+  profilePalette?: string[];
+  profileShowGrid?: boolean;
+  profileBrush?: 'pencil' | 'circle' | 'spray' | 'ink' | 'charcoal' | 'watercolor';
+  profileBrushWidth?: number;
+  initialCanvasJson?: string | null;
+  onCanvasChange?: (json: string) => void;
+}
+
+export const CanvasInclusivo: React.FC<CanvasProps> = ({ commands, canvasApiRef, layers, activeLayerId, accessibility, workProfile, profilePalette, profileShowGrid, profileBrush, profileBrushWidth, initialCanvasJson, onCanvasChange }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
-  const [fabricCanvas, setFabricCanvas] = useState<fabric.Canvas | null>(null);
-
-  // Hook de Persistencia Local (LocalStorage cada 30 segundos y restauración)
-  const {
-    showRestorePrompt,
-    savedTimestamp,
-    lastAutoSaveTime,
-    restoreSavedCanvas,
-    discardSavedCanvas,
-    forceSaveNow
-  } = useCanvasPersistence({
-    fabricCanvas,
-    onRestoreFeedback: onActionFeedback
-  });
-  
-  // Estado de Herramientas
-  const [activeTool, setActiveTool] = useState<ToolType>('brush');
+  const imageInputRef = useRef<HTMLInputElement>(null);
+  const refImageInputRef = useRef<HTMLInputElement>(null);
+  const fabricCanvasRef = useRef<fabric.Canvas | null>(null);
+  const [activeTool, setActiveTool] = useState<ToolType>('pencil');
   const [color, setColor] = useState('#3B82F6');
-  const [brushSize, setBrushSize] = useState<number>(8);
-  const [brushOpacity, setBrushOpacity] = useState<number>(100);
-  const [stylusPressureEnabled, setStylusPressureEnabled] = useState<boolean>(true);
-  const [lastPressure, setLastPressure] = useState<number>(0.5);
-
-  // Sistema de Capas
-  const [layers, setLayers] = useState<LayerState[]>([
-    { id: 'layer-manual', name: 'Capa Artista (Manual)', type: 'manual_drawing', visible: true, opacity: 1, locked: false },
-    { id: 'layer-ia', name: 'Capa Base (IA)', type: 'ia_base', visible: true, opacity: 0.95, locked: false },
-  ]);
-  const [activeLayerId, setActiveLayerId] = useState<string>('layer-manual');
-
-  // Historial Deshacer / Rehacer
-  const historyRef = useRef<string[]>([]);
-  const historyIndexRef = useRef<number>(-1);
-  const isUndoRedoAction = useRef<boolean>(false);
+  const [brushWidth, setBrushWidth] = useState(5);
+  const [brushOpacity, setBrushOpacity] = useState(1);
+  const [brushType, setBrushType] = useState<BrushType>('pencil');
+  const [objectSize, setObjectSize] = useState(120);
+  const [objectStrokeWidth, setObjectStrokeWidth] = useState(2);
+  const [panelPosition, setPanelPosition] = useState({ x: 8, y: 8 });
+  const [showGrid, setShowGrid] = useState(false);
+  const [showMagnifier, setShowMagnifier] = useState(false);
+  const [magnifierPos, setMagnifierPos] = useState({ x: 0, y: 0 });
+  const [showAnimation, setShowAnimation] = useState(false);
+  const [snappingEnabled, setSnappingEnabled] = useState(false);
+  const [blendMode, setBlendMode] = useState<BlendMode>('source-over');
+  const [showBlendPicker, setShowBlendPicker] = useState(false);
+  const [panelExpanded, setPanelExpanded] = useState(false);
+  const [toolsExpanded, setToolsExpanded] = useState(false);
+  const [referenceImage, setReferenceImage] = useState<fabric.Image | null>(null);
+  const [animTarget, setAnimTarget] = useState({ x: 200, y: 150, rotation: 0, scale: 1, opacity: 1 });
+  const [isAnimating, setIsAnimating] = useState(false);
+  const animTimeoutRef = useRef<number | null>(null);
   const [canUndo, setCanUndo] = useState(false);
   const [canRedo, setCanRedo] = useState(false);
+  const [liveMessage, setLiveMessage] = useState('Lienzo listo.');
+  const magnifierCanvasRef = useRef<HTMLCanvasElement>(null);
+  const historyRef = useRef<string[]>([]);
+  const historyIndexRef = useRef(-1);
+  const initializedRef = useRef(false);
+  const drawingRef = useRef(false);
+  const backgroundColorRef = useRef('#ffffff');
+  const lastProcessedCommandRef = useRef<AppCommand | null>(commands[commands.length - 1] ?? null);
+  const pendingResizeRef = useRef(false);
+  const panelDragRef = useRef<{ startX: number; startY: number; originX: number; originY: number } | null>(null);
+  const activeLayerRef = useRef(activeLayerId);
+  activeLayerRef.current = activeLayerId;
+  const magnifierEnabledRef = useRef(false);
+  magnifierEnabledRef.current = showMagnifier;
+  const blendModeRef = useRef(blendMode);
+  blendModeRef.current = blendMode;
+  const snappingRef = useRef(false);
+  const guideLinesRef = useRef<{ x: number; y: number; dir: 'h' | 'v' }[]>([]);
 
-  // Paleta de colores vibrantes predeterminados
-  const colorPalette = [
-    '#3B82F6', // Azul eléctrico
-    '#10B981', // Verde esmeralda
-    '#F59E0B', // Ámbar solar
-    '#EF4444', // Rojo carmesí
-    '#8B5CF6', // Violeta neón
-    '#EC4899', // Rosa vibrante
-    '#06B6D4', // Cian claro
-    '#FFFFFF', // Blanco puro
-    '#0F172A', // Tinta profunda
-  ];
-
-  // Guardar estado en historial
-  const saveState = useCallback(() => {
-    if (!fabricCanvas || isUndoRedoAction.current) return;
+  const persistCanvas = useCallback((c: fabric.Canvas, serialized?: string) => {
     try {
-      const json = JSON.stringify(fabricCanvas.toJSON());
-      const nextIndex = historyIndexRef.current + 1;
-      const newHistory = historyRef.current.slice(0, nextIndex);
-      newHistory.push(json);
-      historyRef.current = newHistory;
-      historyIndexRef.current = nextIndex;
-      setCanUndo(historyIndexRef.current > 0);
-      setCanRedo(false);
+      const json = serialized ?? JSON.stringify(c.toJSON());
+      if (json.length > MAX_HISTORY_SIZE_BYTES) {
+        console.warn('Canvas demasiado grande para guardar en localStorage');
+        return;
+      }
+      localStorage.setItem(STORAGE_KEY, json);
+      onCanvasChange?.(json);
     } catch (e) {
-      console.warn("Error guardando estado de historial", e);
+      console.warn('No se pudo guardar el canvas:', e);
     }
-  }, [fabricCanvas]);
+  }, [onCanvasChange]);
 
-  // Inicialización de Fabric.js Canvas
-  useEffect(() => {
-    if (!canvasRef.current) return;
-
-    const c = new fabric.Canvas(canvasRef.current, {
-      width: 820,
-      height: 520,
-      backgroundColor: '#0F172A',
-      isDrawingMode: true,
-      selection: true,
-    });
-
-    // Pincel por defecto
-    const brush = new fabric.PencilBrush(c);
-    brush.color = color;
-    brush.width = brushSize;
-    c.freeDrawingBrush = brush;
-
-    c.on('object:added', () => {
-      if (!isUndoRedoAction.current) saveState();
-    });
-    c.on('object:modified', () => {
-      if (!isUndoRedoAction.current) saveState();
-    });
-
-    setFabricCanvas(c);
-
-    // Guardar estado inicial vacío
-    setTimeout(() => {
-      const initialJson = JSON.stringify(c.toJSON());
-      historyRef.current = [initialJson];
+  const saveState = useCallback((c: fabric.Canvas) => {
+    const json = JSON.stringify(c.toJSON());
+    if (json.length > MAX_HISTORY_SIZE_BYTES) {
+      historyRef.current = [json];
       historyIndexRef.current = 0;
       setCanUndo(false);
       setCanRedo(false);
-    }, 100);
+      persistCanvas(c, json);
+      return;
+    }
+    historyRef.current = historyRef.current.slice(0, historyIndexRef.current + 1);
+    historyRef.current.push(json);
+    if (historyRef.current.length > MAX_HISTORY) historyRef.current.shift();
+    historyIndexRef.current = historyRef.current.length - 1;
+    setCanUndo(historyIndexRef.current > 0);
+    setCanRedo(false);
+    persistCanvas(c, json);
+  }, [persistCanvas]);
+
+  const undo = useCallback(() => {
+    const c = fabricCanvasRef.current;
+    if (!c || historyIndexRef.current <= 0) return;
+    historyIndexRef.current--;
+    const json = historyRef.current[historyIndexRef.current];
+    c.loadFromJSON(JSON.parse(json)).then(() => {
+      c.renderAll();
+      if (typeof c.backgroundColor === 'string') backgroundColorRef.current = c.backgroundColor;
+      persistCanvas(c, json);
+    });
+    setCanUndo(historyIndexRef.current > 0);
+    setCanRedo(true);
+  }, [persistCanvas]);
+
+  const redo = useCallback(() => {
+    const c = fabricCanvasRef.current;
+    if (!c || historyIndexRef.current >= historyRef.current.length - 1) return;
+    historyIndexRef.current++;
+    const json = historyRef.current[historyIndexRef.current];
+    c.loadFromJSON(JSON.parse(json)).then(() => {
+      c.renderAll();
+      if (typeof c.backgroundColor === 'string') backgroundColorRef.current = c.backgroundColor;
+      persistCanvas(c, json);
+    });
+    setCanUndo(true);
+    setCanRedo(historyIndexRef.current < historyRef.current.length - 1);
+  }, [persistCanvas]);
+
+  const exportPNG = useCallback(() => {
+    const c = fabricCanvasRef.current;
+    if (!c) return;
+    const link = document.createElement('a');
+    link.download = `vozart-${Date.now()}.png`;
+    link.href = c.toDataURL({ format: 'png', multiplier: 2 });
+    link.click();
+  }, []);
+
+  const exportJSON = () => {
+    const c = fabricCanvasRef.current;
+    if (!c) return;
+    downloadFile(`vozart-${Date.now()}.json`, JSON.stringify(c.toJSON(), null, 2), 'application/json');
+  };
+
+  const exportSVG = () => {
+    const c = fabricCanvasRef.current;
+    if (!c) return;
+    downloadFile(`vozart-${Date.now()}.svg`, c.toSVG(), 'image/svg+xml');
+  };
+
+  const exportJPG = () => {
+    const c = fabricCanvasRef.current;
+    if (!c) return;
+    const link = document.createElement('a');
+    link.download = `vozart-${Date.now()}.jpg`;
+    link.href = c.toDataURL({ format: 'jpeg', multiplier: 2 });
+    link.click();
+  };
+
+  const addReferenceImage = (file: File) => {
+    const c = fabricCanvasRef.current;
+    if (!c) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      fabric.Image.fromURL(String(reader.result)).then((img) => {
+        img.set({ ...getImagePlacement(c, img, 0.9), opacity: 0.3, selectable: false, evented: false, name: '_reference_' });
+        c.add(img);
+        c.renderAll();
+        setLiveMessage('Imagen de referencia añadida.');
+      });
+    };
+    reader.readAsDataURL(file);
+  };
+
+  const setCanvasBlendMode = (mode: BlendMode) => {
+    setBlendMode(mode);
+    setShowBlendPicker(false);
+    setLiveMessage(`Modo fusión: ${mode}`);
+  };
+
+  const resetView = useCallback(() => {
+    const c = fabricCanvasRef.current;
+    if (!c) return;
+    c.setViewportTransform([1, 0, 0, 1, 0, 0]);
+    c.setZoom(1);
+    c.requestRenderAll();
+  }, []);
+
+  const handleClear = useCallback(() => {
+    const c = fabricCanvasRef.current;
+    if (!c) return;
+    c.clear();
+    backgroundColorRef.current = '#ffffff';
+    c.backgroundColor = backgroundColorRef.current;
+    c.renderAll();
+    saveState(c);
+  }, [saveState]);
+
+  const handleCanvasKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
+    const c = fabricCanvasRef.current;
+    const selected = c?.getActiveObject();
+    const step = event.shiftKey ? 10 : 2;
+    if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'z') {
+      event.preventDefault();
+      undo();
+      setLiveMessage('Deshacer.');
+    }
+    if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'y') {
+      event.preventDefault();
+      redo();
+      setLiveMessage('Rehacer.');
+    }
+    if (event.key === 'Delete' || event.key === 'Backspace') {
+      event.preventDefault();
+      deleteSelectedObject();
+      setLiveMessage('Selección borrada.');
+    }
+    if (event.key.toLowerCase() === 'g') {
+      const next = !showGrid;
+      setShowGrid(next);
+      setLiveMessage(next ? 'Grid visible.' : 'Grid oculto.');
+    }
+    if (event.key.toLowerCase() === 'l') {
+      event.preventDefault();
+      const next = !showMagnifier;
+      setShowMagnifier(next);
+      setLiveMessage(next ? 'Lupa activada.' : 'Lupa desactivada.');
+    }
+    if (event.key === '0') {
+      event.preventDefault();
+      resetView();
+      setLiveMessage('Vista reiniciada.');
+    }
+    if (event.key === '+' || event.key === '=') {
+      event.preventDefault();
+      if (!c) return;
+      c.setZoom(Math.min(4, c.getZoom() + 0.1));
+      c.requestRenderAll();
+      setLiveMessage(`Zoom ${Math.round(c.getZoom() * 100)} por ciento.`);
+    }
+    if (event.key === '-') {
+      event.preventDefault();
+      if (!c) return;
+      c.setZoom(Math.max(0.2, c.getZoom() - 0.1));
+      c.requestRenderAll();
+      setLiveMessage(`Zoom ${Math.round(c.getZoom() * 100)} por ciento.`);
+    }
+    if (!selected) return;
+    if (event.key === 'ArrowLeft' || event.key === 'ArrowRight' || event.key === 'ArrowUp' || event.key === 'ArrowDown') {
+      event.preventDefault();
+      if (event.key === 'ArrowLeft') selected.left = (selected.left || 0) - step;
+      if (event.key === 'ArrowRight') selected.left = (selected.left || 0) + step;
+      if (event.key === 'ArrowUp') selected.top = (selected.top || 0) - step;
+      if (event.key === 'ArrowDown') selected.top = (selected.top || 0) + step;
+      selected.setCoords();
+      c?.requestRenderAll();
+      if (c) saveState(c);
+      setLiveMessage(`Objeto movido ${step} píxeles.`);
+    }
+  };
+
+  const addImageFromFile = (file: File) => {
+    const c = fabricCanvasRef.current;
+    if (!c) return;
+
+    const reader = new FileReader();
+    reader.onload = () => {
+      fabric.Image.fromURL(String(reader.result)).then((img) => {
+        img.set(getImagePlacement(c, img));
+        c.add(img);
+        c.setActiveObject(img);
+        c.renderAll();
+        saveState(c);
+      });
+    };
+    reader.readAsDataURL(file);
+  };
+
+  const getObjectList = useCallback(() => {
+    const c = fabricCanvasRef.current;
+    if (!c) return [];
+    return c.getObjects().map((obj) => {
+      const id = (obj as LayerAwareObject).name || (obj as LayerAwareObject).__uid || '';
+      const type = obj.type || 'unknown';
+      const layer = (obj as LayerAwareObject)._layer || 'sin-capa';
+      return `${type}|${id}|${layer}`;
+    });
+  }, []);
+
+  const getSelectedObjectInfo = useCallback(() => {
+    const c = fabricCanvasRef.current;
+    const obj = c?.getActiveObject();
+    if (!c || !obj) return '';
+    const color = obj.type === 'path' ? obj.stroke : obj.fill;
+    return JSON.stringify({
+      type: obj.type,
+      color: typeof color === 'string' ? color : '',
+      width: Math.round((obj.width || 0) * (obj.scaleX || 1)),
+      height: Math.round((obj.height || 0) * (obj.scaleY || 1)),
+      left: Math.round(obj.left || 0),
+      top: Math.round(obj.top || 0),
+      opacity: obj.opacity,
+    });
+  }, []);
+
+  const playAnimation = useCallback(() => {
+    const c = fabricCanvasRef.current;
+    const obj = c?.getActiveObject();
+    if (!c || !obj || isAnimating) return;
+    setIsAnimating(true);
+    obj.animate(
+      { left: animTarget.x, top: animTarget.y, angle: animTarget.rotation, scaleX: animTarget.scale, scaleY: animTarget.scale, opacity: animTarget.opacity },
+      {
+        duration: 1000,
+        onChange: () => c.requestRenderAll(),
+        onComplete: () => {
+          setIsAnimating(false);
+          saveState(c);
+          setLiveMessage('Animación completada.');
+        },
+      }
+    );
+  }, [animTarget, isAnimating, saveState]);
+
+  const reassignObjectLayer = useCallback((objectId: string, toLayerId: string) => {
+    const c = fabricCanvasRef.current;
+    if (!c) return;
+    for (const obj of c.getObjects()) {
+      if ((obj as LayerAwareObject).name === objectId || (obj as LayerAwareObject).__uid === objectId) {
+        (obj as LayerAwareObject)._layer = toLayerId;
+        break;
+      }
+    }
+    c.requestRenderAll();
+  }, []);
+
+  const loadJSON = useCallback((json?: string | null) => {
+    const c = fabricCanvasRef.current;
+    if (!c) return;
+    if (!json) {
+      c.clear();
+      c.backgroundColor = makeCanvasBackground(showGrid, backgroundColorRef.current);
+      c.isDrawingMode = true;
+      c.requestRenderAll();
+      saveState(c);
+      return;
+    }
+    c.loadFromJSON(JSON.parse(json)).then(() => {
+      if (typeof c.backgroundColor === 'string') backgroundColorRef.current = c.backgroundColor;
+      c.renderAll();
+      saveState(c);
+    }).catch((e) => {
+      console.warn('No se pudo importar el proyecto:', e);
+    });
+  }, [saveState, showGrid]);
+
+  useEffect(() => {
+    if (canvasApiRef) canvasApiRef.current = { exportPNG, reassignObjectLayer, loadJSON, getObjectList, getSelectedObjectInfo };
+  }, [canvasApiRef, exportPNG, reassignObjectLayer, loadJSON, getObjectList, getSelectedObjectInfo]);
+
+  const resizeCanvas = useCallback((c: fabric.Canvas) => {
+    if (!containerRef.current) return;
+    const { width, height } = containerRef.current.getBoundingClientRect();
+    const nextWidth = Math.floor(width);
+    const nextHeight = Math.floor(height);
+    if (nextWidth < 20 || nextHeight < 20) return;
+    if (drawingRef.current) {
+      pendingResizeRef.current = true;
+      return;
+    }
+    if (c.width === nextWidth && c.height === nextHeight) return;
+    c.setDimensions({ width: nextWidth, height: nextHeight });
+    c.renderAll();
+  }, []);
+
+  useEffect(() => {
+    if (!canvasRef.current || !containerRef.current) return;
+
+    const { width, height } = containerRef.current.getBoundingClientRect();
+    const c = new fabric.Canvas(canvasRef.current, {
+      width: Math.floor(width),
+      height: Math.floor(height),
+      backgroundColor: '#ffffff',
+      isDrawingMode: true,
+    });
+    (c as fabric.Canvas & { enablePointerEvents: boolean }).enablePointerEvents = true;
+
+    const trackPointer = (ev: PointerEvent) => {
+      setPointerProps(ev.pressure || 0.5, ev.tiltX || 0, ev.tiltY || 0);
+    };
+    canvasRef.current.addEventListener('pointermove', trackPointer);
+    canvasRef.current.addEventListener('pointerdown', trackPointer);
+
+    c.freeDrawingBrush = new fabric.PencilBrush(c);
+    c.freeDrawingBrush.color = color;
+    c.freeDrawingBrush.width = brushWidth;
+
+    c.on('object:added', (e) => {
+      if (e.target && !(e.target as LayerAwareObject)._layer) (e.target as LayerAwareObject)._layer = activeLayerRef.current;
+      saveState(c);
+    });
+    c.on('object:modified', () => saveState(c));
+    c.on('path:created', (e) => {
+      if (e.path && brushOpacity < 1) e.path.set({ opacity: brushOpacity });
+      saveState(c);
+    });
+    c.on('selection:created', (event) => syncSelectedObject(event.selected?.[0]));
+    c.on('selection:updated', (event) => syncSelectedObject(event.selected?.[0]));
+
+    c.on('mouse:wheel', (opt) => {
+      const ev = opt.e as WheelEvent;
+      const delta = ev.deltaY;
+      let zoom = c.getZoom() * (0.999 ** delta);
+      zoom = Math.max(0.1, Math.min(20, zoom));
+      c.zoomToPoint(new fabric.Point(ev.offsetX, ev.offsetY), zoom);
+      ev.preventDefault();
+      ev.stopPropagation();
+    });
+
+    let isPanning = false;
+    let lastPos = { x: 0, y: 0 };
+
+    c.on('mouse:down', (opt) => {
+      const ev = opt.e as MouseEvent;
+      drawingRef.current = true;
+      ev.preventDefault();
+      if (c.isDrawingMode && c.contextTop && blendModeRef.current !== 'source-over') {
+        c.contextTop.globalCompositeOperation = blendModeRef.current;
+      }
+      if (ev.altKey) {
+        isPanning = true;
+        lastPos = { x: ev.clientX, y: ev.clientY };
+        c.selection = false;
+      }
+    });
+
+    c.on('mouse:move', (opt) => {
+      opt.e.preventDefault();
+      const ev = opt.e as MouseEvent;
+      if (magnifierEnabledRef.current) {
+        setMagnifierPos({ x: ev.offsetX, y: ev.offsetY });
+      }
+      if (!isPanning) return;
+      const vpt = c.viewportTransform!;
+      vpt[4] += ev.clientX - lastPos.x;
+      vpt[5] += ev.clientY - lastPos.y;
+      c.requestRenderAll();
+      lastPos = { x: ev.clientX, y: ev.clientY };
+    });
+
+    c.on('mouse:up', () => {
+      drawingRef.current = false;
+      isPanning = false;
+      c.selection = true;
+      if (c.contextTop) c.contextTop.clearRect(0, 0, c.width || 2000, c.height || 2000);
+      guideLinesRef.current = [];
+      if (pendingResizeRef.current) {
+        pendingResizeRef.current = false;
+        resizeCanvas(c);
+      }
+    });
+
+    const SNAP_THRESHOLD = 6;
+    c.on('object:moving', (opt) => {
+      if (!snappingRef.current) return;
+      const obj = opt.target;
+      if (!obj) return;
+      const objs = c.getObjects().filter(o => o !== obj && o.selectable);
+      const snapLines: { x: number; y: number; dir: 'h' | 'v' }[] = [];
+      const oBounds = obj.getBoundingRect();
+      const oCx = oBounds.left + oBounds.width / 2;
+      const oCy = oBounds.top + oBounds.height / 2;
+      const oR = oBounds.left + oBounds.width;
+      const oB = oBounds.top + oBounds.height;
+      for (const other of objs) {
+        const b = other.getBoundingRect();
+        const checks: { val: number; target: number; dir: 'h' | 'v'; snapTo: number }[] = [
+          { val: oBounds.left, target: b.left, dir: 'v', snapTo: b.left },
+          { val: oR, target: b.left + b.width, dir: 'v', snapTo: b.left + b.width },
+          { val: oBounds.left, target: b.left + b.width, dir: 'v', snapTo: b.left + b.width },
+          { val: oR, target: b.left, dir: 'v', snapTo: b.left },
+          { val: oCx, target: b.left + b.width / 2, dir: 'v', snapTo: b.left + b.width / 2 },
+          { val: oBounds.top, target: b.top, dir: 'h', snapTo: b.top },
+          { val: oB, target: b.top + b.height, dir: 'h', snapTo: b.top + b.height },
+          { val: oBounds.top, target: b.top + b.height, dir: 'h', snapTo: b.top + b.height },
+          { val: oB, target: b.top, dir: 'h', snapTo: b.top },
+          { val: oCy, target: b.top + b.height / 2, dir: 'h', snapTo: b.top + b.height / 2 },
+        ];
+        for (const ch of checks) {
+          if (Math.abs(ch.val - ch.target) < SNAP_THRESHOLD) {
+            if (ch.dir === 'v') {
+              const dx = ch.snapTo - ch.val;
+              obj.left = (obj.left || 0) + dx;
+              snapLines.push({ x: ch.snapTo, y: Math.min(oBounds.top, b.top), dir: 'v' });
+            } else {
+              const dy = ch.snapTo - ch.val;
+              obj.top = (obj.top || 0) + dy;
+              snapLines.push({ y: ch.snapTo, x: Math.min(oBounds.left, b.left), dir: 'h' });
+            }
+            obj.setCoords();
+            break;
+          }
+        }
+      }
+      if (snapLines.length > 0 && c.contextTop) {
+        const ctx = c.contextTop;
+        ctx.clearRect(0, 0, c.width || 2000, c.height || 2000);
+        ctx.strokeStyle = '#3B82F6';
+        ctx.lineWidth = 1;
+        ctx.setLineDash([4, 4]);
+        for (const sl of snapLines) {
+          ctx.beginPath();
+          if (sl.dir === 'v') {
+            ctx.moveTo(sl.x, sl.y);
+            ctx.lineTo(sl.x, sl.y + 2000);
+          } else {
+            ctx.moveTo(sl.x, sl.y);
+            ctx.lineTo(sl.x + 2000, sl.y);
+          }
+          ctx.stroke();
+        }
+        ctx.setLineDash([]);
+      }
+    });
+
+    const preventTouchScroll = (event: TouchEvent) => event.preventDefault();
+    containerRef.current.addEventListener('touchstart', preventTouchScroll, { passive: false });
+    containerRef.current.addEventListener('touchmove', preventTouchScroll, { passive: false });
+
+    const ro = new ResizeObserver(() => resizeCanvas(c));
+    ro.observe(containerRef.current);
+
+    if (!initializedRef.current) {
+      initializedRef.current = true;
+      try {
+        const saved = initialCanvasJson ?? localStorage.getItem(STORAGE_KEY);
+        if (saved) {
+          c.loadFromJSON(JSON.parse(saved)).then(() => {
+            if (typeof c.backgroundColor === 'string') backgroundColorRef.current = c.backgroundColor;
+            c.renderAll();
+            saveState(c);
+          });
+        } else {
+          saveState(c);
+        }
+      } catch (e) {
+        console.warn('No se pudo cargar el canvas:', e);
+        saveState(c);
+      }
+    } else {
+      saveState(c);
+    }
+
+    fabricCanvasRef.current = c;
 
     return () => {
+      ro.disconnect();
+      containerRef.current?.removeEventListener('touchstart', preventTouchScroll);
+      containerRef.current?.removeEventListener('touchmove', preventTouchScroll);
+      if (canvasRef.current) {
+        canvasRef.current.removeEventListener('pointermove', trackPointer);
+        canvasRef.current.removeEventListener('pointerdown', trackPointer);
+      }
       c.dispose();
     };
   }, []);
 
-  // Manejo de sensibilidad de presión para stylus / lápiz óptico
   useEffect(() => {
-    const container = containerRef.current;
-    if (!container || !fabricCanvas || !stylusPressureEnabled) return;
+    const c = fabricCanvasRef.current;
+    if (!c || !profilePalette || profilePalette.length === 0) return;
+    if (profilePalette[0]) setColor(profilePalette[0]);
+  }, [workProfile, profilePalette]);
 
-    const handlePointerMove = (e: PointerEvent) => {
-      // Si el puntero es un lápiz o soporta presión
-      if (e.pointerType === 'pen' && e.pressure > 0) {
-        setLastPressure(e.pressure);
-        if (fabricCanvas.freeDrawingBrush && fabricCanvas.isDrawingMode) {
-          // Modular el grosor en base a la presión del stylus
-          const dynamicWidth = Math.max(2, brushSize * (e.pressure * 1.8));
-          fabricCanvas.freeDrawingBrush.width = dynamicWidth;
-        }
+  useEffect(() => {
+    if (profileShowGrid === undefined) return;
+    setShowGrid(profileShowGrid);
+  }, [workProfile, profileShowGrid]);
+
+  useEffect(() => {
+    if (profileBrush === undefined) return;
+    setBrushType(profileBrush);
+  }, [workProfile, profileBrush]);
+
+  useEffect(() => {
+    if (profileBrushWidth === undefined) return;
+    setBrushWidth(profileBrushWidth);
+  }, [workProfile, profileBrushWidth]);
+
+  useEffect(() => {
+    const c = fabricCanvasRef.current;
+    if (!c) return;
+    let brush = c.freeDrawingBrush;
+
+    if (brushType === 'oil' || brushType === 'watercolor_pro' || brushType === 'charcoal_pro' || brushType === 'spray_pro' || brushType === 'smudge') {
+      brush = createCustomBrush(c, brushType, color, brushWidth, brushOpacity);
+    } else if (brushType === 'circle') {
+      if (!(brush instanceof fabric.CircleBrush)) brush = new fabric.CircleBrush(c);
+    } else if (brushType === 'spray') {
+      if (!(brush instanceof fabric.SprayBrush)) brush = new fabric.SprayBrush(c);
+    } else if (!(brush instanceof fabric.PencilBrush) || brush instanceof fabric.CircleBrush || brush instanceof fabric.SprayBrush) {
+      brush = new fabric.PencilBrush(c);
+    }
+
+    c.freeDrawingBrush = brush;
+    brush.width = brushWidth;
+    brush.color = color;
+
+    if (brushType === 'ink') {
+      brush.width = Math.max(1, brushWidth * 0.9);
+      brush.color = withAlpha(color, Math.min(1, brushOpacity));
+    }
+
+    if (brushType === 'charcoal') {
+      brush.width = Math.max(2, brushWidth * 1.7);
+      brush.color = withAlpha(color, Math.min(0.7, brushOpacity));
+    }
+
+    if (brushType === 'watercolor') {
+      brush.width = Math.max(4, brushWidth * 2.2);
+      brush.color = withAlpha(color, Math.min(0.35, brushOpacity));
+    }
+
+    if (brushType === 'spray' && brush instanceof fabric.SprayBrush) {
+      brush.width = Math.max(10, brushWidth * 2);
+      brush.color = withAlpha(color, Math.min(0.8, brushOpacity));
+      brush.density = Math.max(12, Math.round(brushWidth * 2.5));
+      brush.dotWidth = Math.max(1, Math.round(brushWidth / 4));
+      brush.dotWidthVariance = Math.max(1, Math.round(brushWidth / 5));
+      brush.randomOpacity = true;
+    }
+  }, [brushType, color, brushOpacity, brushWidth]);
+
+  useEffect(() => {
+    const c = fabricCanvasRef.current;
+    if (!c) return;
+    const layerMap = new Map(layers.map(l => [l.id, l]));
+    for (const obj of c.getObjects()) {
+      const layerId = (obj as LayerAwareObject)._layer;
+      const layer = layerId ? layerMap.get(layerId) : undefined;
+      if (layer) {
+        obj.visible = layer.visible;
+        const layerOp = layer.opacity ?? 1;
+        const baseOp = (obj as LayerAwareObject)._baseOpacity ?? obj.opacity ?? 1;
+        if ((obj as LayerAwareObject)._baseOpacity === undefined) (obj as LayerAwareObject)._baseOpacity = obj.opacity ?? 1;
+        obj.opacity = baseOp * layerOp;
+        obj.selectable = !layer.locked;
+        obj.evented = !layer.locked;
       }
-    };
+    }
+    c.requestRenderAll();
+  }, [layers]);
 
-    const handlePointerUp = () => {
-      if (fabricCanvas.freeDrawingBrush) {
-        fabricCanvas.freeDrawingBrush.width = brushSize;
-      }
-    };
+  useEffect(() => {
+    const c = fabricCanvasRef.current;
+    if (!c || !showMagnifier) return;
+    const magCanvas = magnifierCanvasRef.current;
+    if (!magCanvas) return;
+    const magCtx = magCanvas.getContext('2d');
+    if (!magCtx) return;
+    const size = 120;
+    const zoom = 3;
+    const half = size / 2;
+    const vpt = c.viewportTransform;
+    const z = vpt ? vpt[0] : 1;
+    const sx = magnifierPos.x * z - half / zoom;
+    const sy = magnifierPos.y * z - half / zoom;
+    magCanvas.width = size;
+    magCanvas.height = size;
+    magCtx.imageSmoothingEnabled = false;
+    try {
+      magCtx.drawImage(
+        canvasRef.current!,
+        sx, sy, size / zoom, size / zoom,
+        0, 0, size, size
+      );
+    } catch { /* fuera del canvas */ }
+    magCtx.strokeStyle = '#3B82F6';
+    magCtx.lineWidth = 2;
+    magCtx.beginPath();
+    magCtx.arc(half, half, half - 2, 0, Math.PI * 2);
+    magCtx.stroke();
+  }, [showMagnifier, magnifierPos]);
 
-    container.addEventListener('pointermove', handlePointerMove);
-    container.addEventListener('pointerup', handlePointerUp);
-    return () => {
-      container.removeEventListener('pointermove', handlePointerMove);
-      container.removeEventListener('pointerup', handlePointerUp);
-    };
-  }, [fabricCanvas, brushSize, stylusPressureEnabled]);
+  useEffect(() => {
+    const c = fabricCanvasRef.current;
+    if (!c || commands.length === 0) return;
+    const last = commands[commands.length - 1];
+    if (lastProcessedCommandRef.current === last) return;
+    lastProcessedCommandRef.current = last;
+    if (last.type !== 'AI_ACTION') return;
+    dispatchAIAction(last.data, {
+      canvas: c,
+      objectStrokeWidth,
+      showGrid,
+      backgroundColorRef,
+      saveState,
+      handleClear,
+      setLiveMessage,
+    });
+  }, [commands, handleClear, objectStrokeWidth, saveState, showGrid]);
 
-  // Actualizar configuración del pincel según la herramienta seleccionada
-  const applyToolConfig = useCallback((tool: ToolType, selectedColor: string, size: number, opacity: number) => {
-    if (!fabricCanvas) return;
+  useEffect(() => {
+    const c = fabricCanvasRef.current;
+    if (!c) return;
+    c.backgroundColor = makeCanvasBackground(showGrid, backgroundColorRef.current);
+    c.requestRenderAll();
+  }, [showGrid]);
 
-    const hexToRgba = (hex: string, alpha: number) => {
-      const r = parseInt(hex.slice(1, 3), 16) || 0;
-      const g = parseInt(hex.slice(3, 5), 16) || 0;
-      const b = parseInt(hex.slice(5, 7), 16) || 0;
-      return `rgba(${r}, ${g}, ${b}, ${alpha / 100})`;
-    };
+  const applyToActiveObject = useCallback((updates: Record<string, unknown>) => {
+    const c = fabricCanvasRef.current;
+    const obj = c?.getActiveObject();
+    if (!c || !obj) return;
+    obj.set(updates);
+    obj.setCoords();
+    c.requestRenderAll();
+    saveState(c);
+  }, [saveState]);
 
-    const currentColor = hexToRgba(selectedColor, opacity);
+  const deleteSelectedObject = useCallback(() => {
+    const c = fabricCanvasRef.current;
+    const obj = c?.getActiveObject();
+    if (!c || !obj) return;
 
-    if (tool === 'pencil' || tool === 'brush' || tool === 'marker' || tool === 'eraser') {
-      fabricCanvas.isDrawingMode = true;
-      const brush = new fabric.PencilBrush(fabricCanvas);
-
-      if (tool === 'eraser') {
-        brush.color = '#0F172A'; // Borra con el color de fondo base
-        brush.width = size * 2.5;
-      } else if (tool === 'marker') {
-        brush.color = hexToRgba(selectedColor, 40); // Trazado semitransparente
-        brush.width = size * 2;
-      } else if (tool === 'pencil') {
-        brush.color = selectedColor;
-        brush.width = Math.max(1, Math.floor(size / 2));
-      } else {
-        // Pincel estándar
-        brush.color = currentColor;
-        brush.width = size;
-      }
-
-      fabricCanvas.freeDrawingBrush = brush;
+    if (obj.type === 'activeSelection' && 'forEachObject' in obj) {
+      (obj as fabric.ActiveSelection).forEachObject((item) => c.remove(item));
     } else {
-      fabricCanvas.isDrawingMode = false;
+      c.remove(obj);
     }
-  }, [fabricCanvas]);
+    c.discardActiveObject();
+    c.requestRenderAll();
+    saveState(c);
+    setLiveMessage('Objeto eliminado.');
+  }, [saveState]);
 
-  // Reaccionar a cambios de herramienta, color, tamaño y opacidad
-  useEffect(() => {
-    applyToolConfig(activeTool, color, brushSize, brushOpacity);
-  }, [activeTool, color, brushSize, brushOpacity, applyToolConfig]);
-
-  // Deshacer acción
-  const handleUndo = () => {
-    if (!fabricCanvas || historyIndexRef.current <= 0) return;
-    isUndoRedoAction.current = true;
-    const prevIndex = historyIndexRef.current - 1;
-    const jsonState = historyRef.current[prevIndex];
-    fabricCanvas.loadFromJSON(JSON.parse(jsonState)).then(() => {
-      fabricCanvas.renderAll();
-      historyIndexRef.current = prevIndex;
-      setCanUndo(historyIndexRef.current > 0);
-      setCanRedo(historyIndexRef.current < historyRef.current.length - 1);
-      isUndoRedoAction.current = false;
-      onActionFeedback?.("Paso anterior restaurado (Deshacer)");
-    });
+  const syncSelectedObject = (obj?: fabric.Object) => {
+    if (!obj) {
+      setLiveMessage('Sin selección.');
+      return;
+    }
+    const selectedColor = obj.type === 'path' ? obj.stroke : obj.fill;
+    if (typeof selectedColor === 'string') setColor(selectedColor);
+    if (typeof obj.strokeWidth === 'number') setObjectStrokeWidth(obj.strokeWidth);
+    if (obj.type === 'path' && typeof obj.strokeWidth === 'number') setBrushWidth(Math.round(obj.strokeWidth));
+    if (typeof obj.width === 'number' && obj.width > 0 && obj.type !== 'path') setObjectSize(Math.round(obj.width * (obj.scaleX || 1)));
+    setLiveMessage(`Seleccionado ${obj.type || 'objeto'}.`);
   };
 
-  // Rehacer acción
-  const handleRedo = () => {
-    if (!fabricCanvas || historyIndexRef.current >= historyRef.current.length - 1) return;
-    isUndoRedoAction.current = true;
-    const nextIndex = historyIndexRef.current + 1;
-    const jsonState = historyRef.current[nextIndex];
-    fabricCanvas.loadFromJSON(JSON.parse(jsonState)).then(() => {
-      fabricCanvas.renderAll();
-      historyIndexRef.current = nextIndex;
-      setCanUndo(true);
-      setCanRedo(historyIndexRef.current < historyRef.current.length - 1);
-      isUndoRedoAction.current = false;
-      onActionFeedback?.("Paso restaurado (Rehacer)");
-    });
+  const changeColor = (nextColor: string) => {
+    setColor(nextColor);
+    const c = fabricCanvasRef.current;
+    const obj = c?.getActiveObject();
+    if (!c || !obj) return;
+    obj.set(obj.type === 'path' ? { stroke: nextColor } : { fill: nextColor });
+    c.requestRenderAll();
+    saveState(c);
+    setLiveMessage(`Color cambiado a ${nextColor}.`);
   };
 
-  // Agregar formas vectoriales
-  const addVectorShape = (shapeType: 'rect' | 'circle' | 'triangle' | 'star') => {
-    if (!fabricCanvas) return;
-    fabricCanvas.isDrawingMode = false;
-    setActiveTool(shapeType);
+  const changeObjectSize = (nextSize: number) => {
+    setObjectSize(nextSize);
+    const c = fabricCanvasRef.current;
+    const obj = c?.getActiveObject();
+    if (!c || !obj) return;
+    obj.set({ scaleX: 1, scaleY: 1 });
+    if (obj.type === 'circle') obj.set({ radius: nextSize / 2 });
+    else if (obj.type === 'rect' || obj.type === 'triangle') obj.set({ width: nextSize, height: nextSize });
+    obj.setCoords();
+    c.requestRenderAll();
+    saveState(c);
+    setLiveMessage(`Tamaño ${nextSize}.`);
+  };
 
-    const baseConfig = {
-      left: 250 + (Math.random() * 80 - 40),
-      top: 180 + (Math.random() * 80 - 40),
-      fill: color,
-      opacity: brushOpacity / 100,
-      stroke: '#FFFFFF',
-      strokeWidth: 1.5,
+  const changeObjectStroke = (nextWidth: number) => {
+    setObjectStrokeWidth(nextWidth);
+    applyToActiveObject({ stroke: '#0F172A', strokeWidth: nextWidth });
+    setLiveMessage(`Borde ${nextWidth}.`);
+  };
+
+  const startPanelDrag = (event: React.PointerEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    event.stopPropagation();
+    panelDragRef.current = {
+      startX: event.clientX,
+      startY: event.clientY,
+      originX: panelPosition.x,
+      originY: panelPosition.y,
     };
+    event.currentTarget.setPointerCapture(event.pointerId);
+  };
 
-    let shapeObj: fabric.Object | null = null;
-    if (shapeType === 'rect') {
-      shapeObj = new fabric.Rect({ ...baseConfig, width: 140, height: 90, rx: 12, ry: 12 });
-    } else if (shapeType === 'circle') {
-      shapeObj = new fabric.Circle({ ...baseConfig, radius: 60 });
-    } else if (shapeType === 'triangle') {
-      shapeObj = new fabric.Triangle({ ...baseConfig, width: 120, height: 110 });
-    } else if (shapeType === 'star') {
-      // Polígono estrella
-      const points = [
-        { x: 50, y: 0 },
-        { x: 65, y: 35 },
-        { x: 100, y: 38 },
-        { x: 72, y: 62 },
-        { x: 82, y: 98 },
-        { x: 50, y: 76 },
-        { x: 18, y: 98 },
-        { x: 28, y: 62 },
-        { x: 0, y: 38 },
-        { x: 35, y: 35 }
-      ];
-      shapeObj = new fabric.Polygon(points, { ...baseConfig, scaleX: 1.2, scaleY: 1.2 });
-    }
+  const dragPanel = (event: React.PointerEvent<HTMLDivElement>) => {
+    const drag = panelDragRef.current;
+    if (!drag) return;
+    event.preventDefault();
+    const maxX = Math.max(8, window.innerWidth - 340);
+    const maxY = Math.max(8, window.innerHeight - 240);
+    setPanelPosition({
+      x: Math.min(Math.max(8, drag.originX + event.clientX - drag.startX), maxX),
+      y: Math.min(Math.max(8, drag.originY + event.clientY - drag.startY), maxY),
+    });
+  };
 
-    if (shapeObj) {
-      // Etiquetar según capa activa
-      (shapeObj as any).vozArtLayer = activeLayerId;
-      fabricCanvas.add(shapeObj);
-      fabricCanvas.setActiveObject(shapeObj);
-      fabricCanvas.renderAll();
-      saveState();
-      onActionFeedback?.(`Forma ${shapeType} insertada en la capa.`);
+  const stopPanelDrag = (event: React.PointerEvent<HTMLDivElement>) => {
+    panelDragRef.current = null;
+    event.currentTarget.releasePointerCapture(event.pointerId);
+  };
+
+  const selectTool = (tool: ToolType) => {
+    const c = fabricCanvasRef.current;
+    if (!c) return;
+    setActiveTool(tool);
+    if (tool === 'pencil') {
+      c.isDrawingMode = true;
+      setLiveMessage('Pincel activo.');
+    } else {
+      c.isDrawingMode = false;
+      const obj = makeShape(tool, color, objectSize, objectStrokeWidth);
+      if (obj) { c.add(obj); c.setActiveObject(obj); setLiveMessage(`${tool} insertado.`); }
     }
   };
-
-  // Limpiar lienzo
-  const handleClearCanvas = () => {
-    if (!fabricCanvas) return;
-    fabricCanvas.clear();
-    fabricCanvas.set({ backgroundColor: '#0F172A' });
-    fabricCanvas.renderAll();
-    saveState();
-    onActionFeedback?.("Lienzo reiniciado por completo.");
-  };
-
-  // Exportar arte digital
-  const handleExport = () => {
-    if (!canvasRef.current) return;
-    const dataUrl = canvasRef.current.toDataURL('image/png');
-    const link = document.createElement('a');
-    link.download = `VozArt-creacion-${new Date().toISOString().slice(0, 10)}.png`;
-    link.href = dataUrl;
-    link.click();
-    onActionFeedback?.("¡Obra descargada con éxito!");
-  };
-
-  // Procesar Comandos de Voz y de la IA
-  useEffect(() => {
-    if (!fabricCanvas || commands.length === 0) return;
-    const lastCommand = commands[commands.length - 1];
-
-    if (lastCommand.type === 'AI_ACTION' && lastCommand.data) {
-      const { action, shape, color: aiColor, size, prompt, tool, artElements, explanation } = lastCommand.data;
-
-      switch (action) {
-        case 'GENERATE_ART':
-          // Arte Generativo para la Capa Base
-          if (aiColor) {
-            fabricCanvas.set({ backgroundColor: aiColor });
-          }
-
-          // Generar elementos artísticos en la capa base
-          if (artElements && Array.isArray(artElements)) {
-            artElements.forEach((elem) => {
-              let obj: fabric.Object | null = null;
-              if (elem.type === 'circle') {
-                obj = new fabric.Circle({
-                  left: elem.x,
-                  top: elem.y,
-                  radius: elem.radius || 40,
-                  fill: elem.fill,
-                  opacity: elem.opacity || 0.6,
-                });
-              } else if (elem.type === 'rect') {
-                obj = new fabric.Rect({
-                  left: elem.x,
-                  top: elem.y,
-                  width: elem.width || 80,
-                  height: elem.height || 80,
-                  fill: elem.fill,
-                  opacity: elem.opacity || 0.6,
-                  rx: 8,
-                  ry: 8,
-                });
-              }
-              if (obj) {
-                (obj as any).vozArtLayer = 'layer-ia';
-                fabricCanvas.add(obj);
-                // Enviar al fondo para que quede como capa base
-                fabricCanvas.sendObjectToBack(obj);
-              }
-            });
-          }
-
-          // Añadir insignia conceptual
-          const badgeText = new fabric.Text(`✨ ${prompt || 'Arte IA'}`, {
-            left: 20,
-            top: 20,
-            fontSize: 16,
-            fill: '#E2E8F0',
-            fontFamily: 'Outfit',
-            opacity: 0.8,
-            selectable: false,
-          });
-          fabricCanvas.add(badgeText);
-          fabricCanvas.renderAll();
-          saveState();
-          onActionFeedback?.(explanation || "Arte base generado por IA");
-          break;
-
-        case 'ADD_SHAPE':
-          if (shape) {
-            if (aiColor) setColor(aiColor);
-            addVectorShape(shape);
-          }
-          break;
-
-        case 'CHANGE_BG':
-          if (aiColor) {
-            fabricCanvas.set({ backgroundColor: aiColor });
-            fabricCanvas.renderAll();
-            saveState();
-            onActionFeedback?.(explanation || `Fondo actualizado a ${aiColor}`);
-          }
-          break;
-
-        case 'SET_TOOL':
-          if (tool) {
-            setActiveTool(tool);
-            onActionFeedback?.(`Herramienta cambiada a ${tool}`);
-          }
-          break;
-
-        case 'SET_COLOR':
-          if (aiColor) {
-            setColor(aiColor);
-            onActionFeedback?.(`Color del trazo: ${aiColor}`);
-          }
-          break;
-
-        case 'CLEAR_CANVAS':
-          handleClearCanvas();
-          break;
-
-        case 'UNDO':
-          handleUndo();
-          break;
-      }
-    }
-  }, [commands, fabricCanvas]);
-
-  // Alternar visibilidad de capas
-  const toggleLayerVisibility = (layerId: string) => {
-    if (!fabricCanvas) return;
-    setLayers(prev => prev.map(l => {
-      if (l.id === layerId) {
-        const nextVisible = !l.visible;
-        // Filtrar objetos del canvas que pertenezcan a esta capa
-        const objects = fabricCanvas.getObjects();
-        objects.forEach((obj: any) => {
-          if (obj.vozArtLayer === layerId) {
-            obj.set({ visible: nextVisible });
-          }
-        });
-        fabricCanvas.renderAll();
-        return { ...l, visible: nextVisible };
-      }
-      return l;
-    }));
-  };
-
-  const isHighContrast = accessibility.highContrast;
-  const isLarge = accessibility.largeButtons;
 
   return (
-    <div className="flex-1 flex overflow-hidden select-none">
-      {/* Barra de Herramientas Lateral Izquierda */}
-      <aside 
-        className={cn(
-          "bg-slate-900 border-r border-slate-800 flex flex-col items-center py-5 gap-4 shrink-0 z-20 transition-all",
-          isLarge ? "w-24 px-2" : "w-20 px-1",
-          isHighContrast && "bg-black border-yellow-400 border-r-2"
-        )}
-        aria-label="Panel de herramientas de dibujo manual"
-      >
-        {/* Herramientas de trazo */}
-        <div className="flex flex-col gap-2.5">
+    <div className="flex-1 min-h-0 min-w-0 flex flex-col-reverse md:flex-row overflow-hidden touch-none overscroll-none">
+      <aside className={cn("h-16 md:h-full md:w-20 bg-slate-900 border-t md:border-t-0 md:border-r border-slate-800 flex md:flex-col items-center justify-around md:justify-start md:py-6 px-2 md:px-0 md:gap-3 shrink-0 transition-transform", accessibility.easyRead && "scale-110 origin-bottom-left")}>
+        {TOOLS.map(({ type, icon: Icon, label }) => (
           <button
-            onClick={() => setActiveTool('brush')}
+            key={type}
+            onClick={() => selectTool(type)}
             className={cn(
-              "rounded-2xl flex items-center justify-center transition-all shadow-md group relative",
-              isLarge ? "w-14 h-14" : "w-12 h-12",
-              activeTool === 'brush' 
-                ? "bg-blue-600 text-white shadow-blue-500/30 ring-4 ring-blue-500/20 scale-105" 
-                : "bg-slate-800 text-slate-400 hover:bg-slate-700 hover:text-white",
-              isHighContrast && activeTool === 'brush' && "bg-yellow-400 text-black ring-yellow-300"
+              "w-9 h-9 md:w-12 md:h-12 rounded-xl md:rounded-2xl flex items-center justify-center transition-all shadow-md",
+              activeTool === type
+                ? "bg-blue-600 text-white shadow-blue-500/20 ring-4 ring-blue-500/10"
+                : "bg-slate-800 text-slate-400 hover:bg-slate-700"
             )}
-            title="Pincel Artístico"
-            aria-label="Pincel Artístico"
+             aria-label={label}
           >
-            <Paintbrush size={isLarge ? 24 : 20} />
+            <Icon size={16} className="md:w-5 md:h-5" />
           </button>
+        ))}
 
-          <button
-            onClick={() => setActiveTool('pencil')}
-            className={cn(
-              "rounded-2xl flex items-center justify-center transition-all shadow-md group",
-              isLarge ? "w-14 h-14" : "w-12 h-12",
-              activeTool === 'pencil' 
-                ? "bg-blue-600 text-white shadow-blue-500/30 ring-4 ring-blue-500/20 scale-105" 
-                : "bg-slate-800 text-slate-400 hover:bg-slate-700 hover:text-white",
-              isHighContrast && activeTool === 'pencil' && "bg-yellow-400 text-black ring-yellow-300"
-            )}
-            title="Lápiz Fino"
-            aria-label="Lápiz Fino"
-          >
-            <Pencil size={isLarge ? 24 : 20} />
-          </button>
+        <div className="hidden md:block w-10 h-0.5 bg-slate-800 rounded-full my-2" />
+        <div className="block md:hidden w-0.5 h-6 bg-slate-800 rounded-full" />
 
-          <button
-            onClick={() => setActiveTool('marker')}
-            className={cn(
-              "rounded-2xl flex items-center justify-center transition-all shadow-md group",
-              isLarge ? "w-14 h-14" : "w-12 h-12",
-              activeTool === 'marker' 
-                ? "bg-blue-600 text-white shadow-blue-500/30 ring-4 ring-blue-500/20 scale-105" 
-                : "bg-slate-800 text-slate-400 hover:bg-slate-700 hover:text-white",
-              isHighContrast && activeTool === 'marker' && "bg-yellow-400 text-black ring-yellow-300"
-            )}
-            title="Marcador / Resaltador Semitransparente"
-            aria-label="Marcador"
-          >
-            <Highlighter size={isLarge ? 24 : 20} />
-          </button>
-
-          <button
-            onClick={() => setActiveTool('eraser')}
-            className={cn(
-              "rounded-2xl flex items-center justify-center transition-all shadow-md group",
-              isLarge ? "w-14 h-14" : "w-12 h-12",
-              activeTool === 'eraser' 
-                ? "bg-red-500 text-white shadow-red-500/30 ring-4 ring-red-500/20 scale-105" 
-                : "bg-slate-800 text-slate-400 hover:bg-slate-700 hover:text-white",
-              isHighContrast && activeTool === 'eraser' && "bg-yellow-400 text-black ring-yellow-300"
-            )}
-            title="Goma de Borrar"
-            aria-label="Goma de Borrar"
-          >
-            <Eraser size={isLarge ? 24 : 20} />
-          </button>
-        </div>
-
-        <div className="w-10 h-0.5 bg-slate-800 rounded-full my-1" />
-
-        {/* Formas Geométricas */}
-        <div className="flex flex-col gap-2">
-          <button
-            onClick={() => addVectorShape('rect')}
-            className="w-10 h-10 rounded-xl bg-slate-800 text-slate-400 hover:bg-slate-700 hover:text-white flex items-center justify-center transition-colors"
-            title="Añadir Rectángulo"
-            aria-label="Añadir Rectángulo"
-          >
-            <Square size={16} />
-          </button>
-          <button
-            onClick={() => addVectorShape('circle')}
-            className="w-10 h-10 rounded-xl bg-slate-800 text-slate-400 hover:bg-slate-700 hover:text-white flex items-center justify-center transition-colors"
-            title="Añadir Círculo"
-            aria-label="Añadir Círculo"
-          >
-            <Circle size={16} />
-          </button>
-          <button
-            onClick={() => addVectorShape('triangle')}
-            className="w-10 h-10 rounded-xl bg-slate-800 text-slate-400 hover:bg-slate-700 hover:text-white flex items-center justify-center transition-colors"
-            title="Añadir Triángulo"
-            aria-label="Añadir Triángulo"
-          >
-            <Triangle size={16} />
-          </button>
-          <button
-            onClick={() => addVectorShape('star')}
-            className="w-10 h-10 rounded-xl bg-slate-800 text-slate-400 hover:bg-slate-700 hover:text-white flex items-center justify-center transition-colors"
-            title="Añadir Estrella"
-            aria-label="Añadir Estrella"
-          >
-            <Star size={16} />
-          </button>
-        </div>
-
-        {/* Selector de color rápido */}
-        <div className="flex flex-col items-center gap-2 mt-auto mb-2">
-          <div className="grid grid-cols-2 gap-1.5 p-1 bg-slate-950/70 rounded-xl border border-slate-800">
-            {colorPalette.slice(0, 6).map((c) => (
-              <button
-                key={c}
-                onClick={() => setColor(c)}
-                style={{ backgroundColor: c }}
-                className={cn(
-                  "w-5 h-5 rounded-full transition-transform",
-                  color === c ? "scale-125 ring-2 ring-white" : "opacity-80 hover:opacity-100"
-                )}
-                aria-label={`Color ${c}`}
-              />
-            ))}
-          </div>
-
-          <label className="cursor-pointer relative group" title="Selector de Color Personalizado">
-            <input
-              type="color"
-              value={color}
-              onChange={(e) => setColor(e.target.value)}
-              className="sr-only"
-            />
-            <div 
-              style={{ backgroundColor: color }}
-              className="w-8 h-8 rounded-full border-2 border-white shadow-md flex items-center justify-center text-[10px] text-white font-bold group-hover:scale-110 transition-transform"
-            >
-              +
-            </div>
-          </label>
-        </div>
-
-        {/* Botón de limpiar lienzo */}
         <button
-          onClick={handleClearCanvas}
-          className="w-11 h-11 bg-slate-800/80 text-red-400 hover:bg-red-500 hover:text-white rounded-2xl flex items-center justify-center transition-colors shadow-sm"
-          title="Reiniciar Lienzo"
-          aria-label="Reiniciar Lienzo"
+          onClick={undo}
+          disabled={!canUndo}
+          aria-label="Deshacer"
+          className={cn("w-9 h-9 md:w-12 md:h-12 rounded-xl md:rounded-2xl flex items-center justify-center transition-all shadow-md", canUndo ? "bg-slate-800 text-slate-300 hover:bg-slate-700" : "bg-slate-900 text-slate-700 cursor-not-allowed")}
         >
-          <Trash2 size={18} />
+          <Undo2 size={14} className="md:w-[18px] md:h-[18px]" />
+        </button>
+
+        <button
+          onClick={redo}
+          disabled={!canRedo}
+          aria-label="Rehacer"
+          className={cn("w-9 h-9 md:w-12 md:h-12 rounded-xl md:rounded-2xl flex items-center justify-center transition-all shadow-md", canRedo ? "bg-slate-800 text-slate-300 hover:bg-slate-700" : "bg-slate-900 text-slate-700 cursor-not-allowed")}
+        >
+          <Redo2 size={14} className="md:w-[18px] md:h-[18px]" />
+        </button>
+
+        <button
+          onClick={exportPNG}
+          aria-label="Exportar PNG"
+          className="w-9 h-9 md:w-12 md:h-12 rounded-xl md:rounded-2xl bg-slate-800 text-emerald-400 hover:bg-emerald-600 hover:text-white flex items-center justify-center transition-all shadow-md"
+        >
+          <Download size={14} className="md:w-[18px] md:h-[18px]" />
+        </button>
+
+        <button
+          onClick={handleClear}
+          aria-label="Limpiar canvas"
+          className="w-9 h-9 md:w-12 md:h-12 rounded-xl md:rounded-2xl bg-slate-800 text-red-400 hover:bg-red-500 hover:text-white flex items-center justify-center transition-all shadow-sm md:mt-auto"
+        >
+          <Trash2 size={16} className="md:w-5 md:h-5" />
         </button>
       </aside>
 
-      {/* Área Central de Lienzo */}
-      <section 
-        ref={containerRef}
-        className={cn(
-          "flex-1 bg-slate-950 relative flex flex-col items-center justify-center p-6 overflow-hidden",
-          isHighContrast && "bg-black"
-        )}
-      >
-        {/* Banner de Recuperación de Sesión Guardada */}
-        <RestoreWorkBanner
-          isOpen={showRestorePrompt}
-          savedTimestamp={savedTimestamp}
-          onRestore={restoreSavedCanvas}
-          onDiscard={discardSavedCanvas}
-          isHighContrast={isHighContrast}
-        />
-
-        {/* Barra superior del lienzo: Controles de Trazo, Grosor y Acciones */}
-        <div className="w-full max-w-4xl mb-4 flex items-center justify-between gap-4 bg-slate-900/90 backdrop-blur-md px-6 py-3 rounded-2xl border border-slate-800 shadow-xl">
-          {/* Tamaño y Opacidad */}
-          <div className="flex items-center gap-6">
-            <div className="flex items-center gap-2.5">
-              <span className="text-xs font-bold text-slate-400 uppercase tracking-wider">Grosor</span>
-              <input
-                type="range"
-                min="2"
-                max="60"
-                value={brushSize}
-                onChange={(e) => setBrushSize(Number(e.target.value))}
-                className="w-24 accent-blue-500 cursor-pointer h-1.5 bg-slate-800 rounded-lg"
+      <section className={cn("flex-1 min-h-0 min-w-0 relative overflow-hidden touch-none overscroll-none", accessibility.highContrast ? "bg-black" : "bg-slate-950")}>
+        <div aria-live="polite" aria-atomic="true" className="sr-only">{liveMessage}</div>
+        <div className="absolute inset-0 p-1 md:p-2">
+          <div
+            ref={containerRef}
+            tabIndex={0}
+            onKeyDown={handleCanvasKeyDown}
+            className={cn("w-full h-full rounded-xl md:rounded-2xl overflow-hidden border touch-none overscroll-none outline-none focus:ring-4", accessibility.highContrast ? "bg-white border-white focus:ring-yellow-400" : "bg-white border-slate-800 focus:ring-blue-500/40")}
+            role="application"
+            aria-label="Lienzo de dibujo VozArt. Atajos: Control Z deshacer, Control Y rehacer, Delete borrar selección, G grid, L lupa, flechas mover selección, Shift más flechas mueve más rápido, más y menos zoom, 0 reinicia vista."
+          >
+            <canvas ref={canvasRef} className="block touch-none" />
+            {showMagnifier && (
+              <canvas
+                ref={magnifierCanvasRef}
+                className="pointer-events-none absolute rounded-full border-2 border-blue-500 shadow-xl"
+                style={{
+                  width: 120,
+                  height: 120,
+                  left: Math.min(magnifierPos.x - 60, (containerRef.current?.clientWidth || 600) - 130),
+                  top: Math.min(magnifierPos.y - 60, (containerRef.current?.clientHeight || 400) - 130),
+                  imageRendering: 'pixelated',
+                  zIndex: 30,
+                }}
+                aria-hidden="true"
               />
-              <span className="text-xs font-mono font-bold text-white w-6">{brushSize}px</span>
-            </div>
-
-            <div className="hidden sm:flex items-center gap-2.5">
-              <span className="text-xs font-bold text-slate-400 uppercase tracking-wider">Opacidad</span>
-              <input
-                type="range"
-                min="10"
-                max="100"
-                value={brushOpacity}
-                onChange={(e) => setBrushOpacity(Number(e.target.value))}
-                className="w-20 accent-emerald-400 cursor-pointer h-1.5 bg-slate-800 rounded-lg"
-              />
-              <span className="text-xs font-mono font-bold text-white w-8">{brushOpacity}%</span>
-            </div>
-
-            {/* Sensibilidad Stylus */}
-            <button
-              onClick={() => setStylusPressureEnabled(!stylusPressureEnabled)}
-              className={cn(
-                "hidden md:flex items-center gap-1.5 px-3 py-1 rounded-lg text-xs font-medium border transition-colors",
-                stylusPressureEnabled 
-                  ? "bg-blue-500/10 text-blue-400 border-blue-500/30" 
-                  : "bg-slate-800 text-slate-500 border-slate-700"
-              )}
-              title="Sensibilidad de presión con Stylus / Lápiz óptico"
-            >
-              <span>Stylus</span>
-              <span className={cn("w-1.5 h-1.5 rounded-full", stylusPressureEnabled ? "bg-blue-400 animate-pulse" : "bg-slate-600")} />
-            </button>
-          </div>
-
-          {/* Deshacer, Rehacer, Guardar y Exportar */}
-          <div className="flex items-center gap-2">
-            <button
-              onClick={handleUndo}
-              disabled={!canUndo}
-              className="p-2 bg-slate-800 hover:bg-slate-700 text-slate-300 disabled:opacity-40 disabled:hover:bg-slate-800 rounded-xl transition-colors"
-              title="Deshacer (Ctrl+Z)"
-              aria-label="Deshacer"
-            >
-              <Undo2 size={16} />
-            </button>
-            <button
-              onClick={handleRedo}
-              disabled={!canRedo}
-              className="p-2 bg-slate-800 hover:bg-slate-700 text-slate-300 disabled:opacity-40 disabled:hover:bg-slate-800 rounded-xl transition-colors"
-              title="Rehacer (Ctrl+Y)"
-              aria-label="Rehacer"
-            >
-              <Redo2 size={16} />
-            </button>
-
-            <button
-              onClick={forceSaveNow}
-              className="hidden lg:flex items-center gap-1.5 px-3 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white rounded-xl text-xs font-medium transition-colors"
-              title={lastAutoSaveTime ? `Autoguardado cada 30s. Último: ${lastAutoSaveTime.toLocaleTimeString()}` : "Guardar estado en LocalStorage"}
-            >
-              <Save size={14} className="text-emerald-400" />
-              <span>Guardar</span>
-            </button>
-
-            <div className="w-[1px] h-6 bg-slate-800 mx-1" />
-
-            <button
-              onClick={handleExport}
-              className="flex items-center gap-2 px-4 py-2 bg-gradient-to-r from-blue-600 to-emerald-500 hover:from-blue-500 hover:to-emerald-400 text-white rounded-xl text-xs font-bold shadow-lg shadow-blue-500/20 transition-all hover:scale-105 active:scale-95"
-              title="Descargar Obra en PNG"
-            >
-              <Download size={14} />
-              <span>Exportar PNG</span>
-            </button>
-          </div>
-        </div>
-
-        {/* Marco Principal del Canvas */}
-        <div className={cn(
-          "w-full max-w-4xl bg-slate-900 rounded-[2rem] p-3 border border-slate-800 shadow-2xl relative",
-          isHighContrast && "border-2 border-yellow-400 bg-black"
-        )}>
-          {/* Etiquetas Superiores de Capas */}
-          <div className="absolute top-6 left-6 flex items-center gap-2 z-10 pointer-events-none">
-            <span className="px-3 py-1 bg-black/50 backdrop-blur-md rounded-full text-[10px] font-bold text-emerald-400 uppercase tracking-widest border border-emerald-500/30 flex items-center gap-1.5">
-              <Sparkles size={10} /> Capa Base IA
-            </span>
-            <span className="px-3 py-1 bg-blue-500/90 backdrop-blur-md rounded-full text-[10px] font-bold text-white uppercase tracking-widest flex items-center gap-1.5">
-              <Pencil size={10} /> Artista: Manual
-            </span>
-            {stylusPressureEnabled && lastPressure > 0 && (
-              <span className="hidden sm:inline-block px-2.5 py-1 bg-slate-800/80 rounded-full text-[9px] text-slate-400 font-mono">
-                Presión: {Math.round(lastPressure * 100)}%
-              </span>
             )}
           </div>
+        </div>
 
-          <div className="canvas-outline rounded-[1.5rem] overflow-hidden bg-slate-950 flex items-center justify-center">
-            <canvas ref={canvasRef} id="canvas-vozart" />
+        <div
+          className={cn(
+            "absolute z-20 max-w-[calc(100%-16px)] rounded-2xl border border-slate-700/80 bg-slate-950/90 p-3 shadow-2xl backdrop-blur touch-auto transition-transform",
+            panelExpanded && "md:w-80",
+            accessibility.easyRead && "scale-110 origin-top-left"
+          )}
+          style={{ left: panelPosition.x, top: panelPosition.y }}
+          onPointerDown={(e) => e.stopPropagation()}
+        >
+          <input
+            ref={imageInputRef}
+            type="file"
+            accept="image/*"
+            className="hidden"
+            onChange={(e) => {
+              const file = e.target.files?.[0];
+              if (file) addImageFromFile(file);
+              e.target.value = '';
+            }}
+          />
+          <input
+            ref={refImageInputRef}
+            type="file"
+            accept="image/*"
+            className="hidden"
+            onChange={(e) => {
+              const file = e.target.files?.[0];
+              if (file) addReferenceImage(file);
+              e.target.value = '';
+            }}
+          />
+
+          <div
+            className="mb-3 flex touch-none items-center justify-between rounded-xl bg-slate-800/80 px-3 py-2 text-[10px] font-black uppercase tracking-widest text-slate-300"
+            onPointerDown={startPanelDrag}
+            onPointerMove={dragPanel}
+            onPointerUp={stopPanelDrag}
+            onPointerCancel={stopPanelDrag}
+          >
+            <span className="flex items-center gap-1 cursor-move text-slate-500">
+              <Move size={13} /> Mover
+            </span>
+            <span className="font-black text-slate-300">Herramientas</span>
+            <button
+              type="button"
+              aria-expanded={panelExpanded}
+              aria-controls="canvas-tool-options"
+              aria-label={panelExpanded ? 'Ocultar herramientas' : 'Mostrar herramientas'}
+              onPointerDown={(event) => event.stopPropagation()}
+              onClick={() => setPanelExpanded((expanded) => !expanded)}
+              className="min-h-10 rounded-lg bg-slate-700 px-3 text-[10px] font-black text-white hover:bg-slate-600"
+            >
+              {panelExpanded ? 'Cerrar' : 'Abrir'}
+            </button>
+          </div>
+
+          <div id="canvas-tool-options" hidden={!panelExpanded}>
+          <p className="mb-3 rounded-xl bg-slate-800/60 px-3 py-2 text-[10px] font-bold text-slate-300">
+            {profileHint[workProfile]}
+          </p>
+
+          <p className={cn("mb-3 rounded-xl px-3 py-2 text-[10px] font-bold", accessibility.easyRead ? "bg-emerald-500/15 text-emerald-200" : "bg-slate-800/40 text-slate-400")}>
+            {accessibility.easyRead ? 'Modo accesible: usa Tab para enfocar el lienzo y flechas para mover la selección.' : 'Atajos: Z/Y deshacer y rehacer, G grid, 0 reset, +/- zoom.'}
+          </p>
+
+          <div className="flex flex-wrap items-center gap-2">
+            {(profilePalette && profilePalette.length > 0 ? profilePalette : COLOR_SWATCHES).map((swatch) => (
+              <button
+                key={swatch}
+                onClick={() => changeColor(swatch)}
+                className={cn(
+                  'h-7 w-7 rounded-full border shadow-sm transition-transform active:scale-95',
+                  color === swatch ? 'border-white ring-2 ring-blue-400' : 'border-slate-600'
+                )}
+                style={{ backgroundColor: swatch }}
+                aria-label={`Color ${swatch}`}
+              />
+            ))}
+          <label className="flex items-center gap-2">
+            <span className="text-[9px] font-bold text-slate-400">Color</span>
+            <input
+              type="color"
+              value={color}
+              onChange={(e) => changeColor(e.target.value)}
+              className="h-7 w-9 rounded-lg border border-slate-600 bg-transparent p-0.5"
+              aria-label="Color personalizado"
+            />
+          </label>
+          </div>
+
+          <div className="mt-3 grid grid-cols-1 gap-2 text-[10px] font-bold uppercase tracking-wider text-slate-400">
+            <label className="grid grid-cols-[72px_1fr_28px] items-center gap-2">
+              Pincel
+              <input type="range" min="1" max="40" value={brushWidth} onChange={(e) => setBrushWidth(Number(e.target.value))} />
+              <span className="text-right text-slate-200">{brushWidth}</span>
+            </label>
+            <label className="grid grid-cols-[72px_1fr_28px] items-center gap-2">
+              Objeto
+              <input type="range" min="40" max="260" step="10" value={objectSize} onChange={(e) => changeObjectSize(Number(e.target.value))} />
+              <span className="text-right text-slate-200">{objectSize}</span>
+            </label>
+            <label className="grid grid-cols-[72px_1fr_28px] items-center gap-2">
+              Opacidad
+              <input type="range" min="0" max="1" step="0.05" value={brushOpacity} onChange={(e) => setBrushOpacity(Number(e.target.value))} />
+              <span className="text-right text-slate-200">{Math.round(brushOpacity * 100)}%</span>
+            </label>
+            <label className="grid grid-cols-[72px_1fr_28px] items-center gap-2">
+              Borde
+              <input type="range" min="0" max="24" value={objectStrokeWidth} onChange={(e) => changeObjectStroke(Number(e.target.value))} />
+              <span className="text-right text-slate-200">{objectStrokeWidth}</span>
+            </label>
+          </div>
+
+          <div className="mt-2 grid grid-cols-3 gap-2 text-[10px] font-black uppercase tracking-wider">
+            <button onClick={() => setBrushType('pencil')} className={cn('rounded-xl px-2 py-2', brushType === 'pencil' ? 'bg-blue-600 text-white' : 'bg-slate-800 text-slate-300 hover:bg-slate-700')}>Pincel</button>
+            <button onClick={() => setBrushType('circle')} className={cn('rounded-xl px-2 py-2', brushType === 'circle' ? 'bg-blue-600 text-white' : 'bg-slate-800 text-slate-300 hover:bg-slate-700')}>Círculo</button>
+            <button onClick={() => setBrushType('spray')} className={cn('rounded-xl px-2 py-2', brushType === 'spray' ? 'bg-blue-600 text-white' : 'bg-slate-800 text-slate-300 hover:bg-slate-700')}>Spray</button>
+            <button onClick={() => setBrushType('ink')} className={cn('rounded-xl px-2 py-2', brushType === 'ink' ? 'bg-blue-600 text-white' : 'bg-slate-800 text-slate-300 hover:bg-slate-700')}>Tinta</button>
+            <button onClick={() => setBrushType('charcoal')} className={cn('rounded-xl px-2 py-2', brushType === 'charcoal' ? 'bg-blue-600 text-white' : 'bg-slate-800 text-slate-300 hover:bg-slate-700')}>Carbón</button>
+            <button onClick={() => setBrushType('watercolor')} className={cn('rounded-xl px-2 py-2', brushType === 'watercolor' ? 'bg-blue-600 text-white' : 'bg-slate-800 text-slate-300 hover:bg-slate-700')}>Acuarela</button>
+            <button onClick={() => setBrushType('oil')} className={cn('rounded-xl px-2 py-2', brushType === 'oil' ? 'bg-amber-600 text-white' : 'bg-slate-800 text-slate-300 hover:bg-slate-700')}>Óleo</button>
+            <button onClick={() => setBrushType('charcoal_pro')} className={cn('rounded-xl px-2 py-2', brushType === 'charcoal_pro' ? 'bg-stone-600 text-white' : 'bg-slate-800 text-slate-300 hover:bg-slate-700')}>Carbón+</button>
+            <button onClick={() => setBrushType('watercolor_pro')} className={cn('rounded-xl px-2 py-2', brushType === 'watercolor_pro' ? 'bg-cyan-600 text-white' : 'bg-slate-800 text-slate-300 hover:bg-slate-700')}>Acuarela+</button>
+            <button onClick={() => setBrushType('spray_pro')} className={cn('rounded-xl px-2 py-2', brushType === 'spray_pro' ? 'bg-teal-600 text-white' : 'bg-slate-800 text-slate-300 hover:bg-slate-700')}>Spray+</button>
+            <button onClick={() => setBrushType('smudge')} className={cn('rounded-xl px-2 py-2', brushType === 'smudge' ? 'bg-rose-600 text-white' : 'bg-slate-800 text-slate-300 hover:bg-slate-700')}>Difuminar</button>
+          </div>
+
+          <button
+            onClick={deleteSelectedObject}
+            className="mt-3 flex w-full items-center justify-center gap-2 rounded-xl bg-red-500/15 px-3 py-2 text-xs font-black text-red-300 transition-colors hover:bg-red-500 hover:text-white"
+          >
+            <Trash2 size={14} /> Borrar selección
+          </button>
+
+          <button
+            type="button"
+            onClick={() => setToolsExpanded(prev => !prev)}
+            aria-expanded={toolsExpanded}
+            className="mt-2 flex w-full min-h-11 items-center justify-center gap-2 rounded-xl bg-slate-800 px-3 py-2 text-[10px] font-black uppercase tracking-wider text-slate-300 transition-colors hover:bg-slate-700"
+          >
+            {toolsExpanded ? 'Menos herramientas' : 'Más herramientas'}
+          </button>
+
+          {toolsExpanded && (
+          <>
+          <button
+            onClick={() => setShowBlendPicker(prev => !prev)}
+            className={cn('mt-2 flex w-full items-center justify-center gap-2 rounded-xl px-3 py-2 text-[10px] font-black uppercase tracking-wider transition-colors', showBlendPicker || blendMode !== 'source-over' ? 'bg-purple-600 text-white' : 'bg-slate-800 text-slate-300 hover:bg-slate-700')}
+          >
+            <Blend size={12} /> {blendMode === 'source-over' ? 'Fusión' : blendMode}
+          </button>
+          {showBlendPicker && (
+            <div className="mt-1 grid grid-cols-3 gap-1 text-[9px] font-bold">
+              {BLEND_MODES.map((m) => (
+                <button key={m.value} onClick={() => setCanvasBlendMode(m.value)} className={cn('rounded-lg px-1.5 py-1', blendMode === m.value ? 'bg-purple-600 text-white' : 'bg-slate-800 text-slate-300 hover:bg-slate-700')}>{m.label}</button>
+              ))}
+            </div>
+          )}
+
+          <div className="mt-2 space-y-2">
+            <div className="grid grid-cols-2 gap-2 text-[10px] font-black uppercase tracking-wider">
+              <button onClick={resetView} className="rounded-xl bg-slate-800 px-2 py-2 text-slate-300 hover:bg-slate-700">Reset vista</button>
+              <button onClick={() => setShowGrid((prev) => !prev)} className={cn('rounded-xl px-2 py-2', showGrid ? 'bg-blue-600 text-white' : 'bg-slate-800 text-slate-300 hover:bg-slate-700')}>Grid</button>
+              <button onClick={() => setShowMagnifier((prev) => !prev)} className={cn('rounded-xl px-2 py-2', showMagnifier ? 'bg-blue-600 text-white' : 'bg-slate-800 text-slate-300 hover:bg-slate-700')}>Lupa</button>
+              <button onClick={() => setShowAnimation((prev) => !prev)} className={cn('rounded-xl px-2 py-2', showAnimation ? 'bg-blue-600 text-white' : 'bg-slate-800 text-slate-300 hover:bg-slate-700')}>Anim</button>
+              <button onClick={() => { const next = !snappingEnabled; setSnappingEnabled(next); snappingRef.current = next; }} className={cn('rounded-xl px-2 py-2', snappingEnabled ? 'bg-cyan-600 text-white' : 'bg-slate-800 text-slate-300 hover:bg-slate-700')}>Snap</button>
+            </div>
+            {showAnimation && (
+              <div className="p-2 rounded-xl bg-slate-900/80 border border-slate-700 space-y-2">
+                <p className="text-[9px] font-bold text-slate-400">Animación del objeto seleccionado</p>
+                <div className="grid grid-cols-2 gap-2 text-[9px]">
+                  <label className="flex items-center gap-1">
+                    X: <input type="range" min={0} max={800} value={animTarget.x} onChange={(e) => setAnimTarget(p => ({ ...p, x: Number(e.target.value) }))} className="flex-1" />
+                  </label>
+                  <label className="flex items-center gap-1">
+                    Y: <input type="range" min={0} max={600} value={animTarget.y} onChange={(e) => setAnimTarget(p => ({ ...p, y: Number(e.target.value) }))} className="flex-1" />
+                  </label>
+                  <label className="flex items-center gap-1">
+                    Rot: <input type="range" min={-180} max={180} value={animTarget.rotation} onChange={(e) => setAnimTarget(p => ({ ...p, rotation: Number(e.target.value) }))} className="flex-1" />
+                  </label>
+                  <label className="flex items-center gap-1">
+                    Esc: <input type="range" min={0.1} max={3} step={0.1} value={animTarget.scale} onChange={(e) => setAnimTarget(p => ({ ...p, scale: Number(e.target.value) }))} className="flex-1" />
+                  </label>
+                  <label className="flex items-center gap-1 col-span-2">
+                    Op: <input type="range" min={0} max={1} step={0.05} value={animTarget.opacity} onChange={(e) => setAnimTarget(p => ({ ...p, opacity: Number(e.target.value) }))} className="flex-1" />
+                  </label>
+                </div>
+                <button
+                  onClick={() => playAnimation()}
+                  disabled={isAnimating}
+                  className="w-full rounded-xl bg-blue-600 px-2 py-2 text-[10px] font-black text-white disabled:opacity-50 hover:bg-blue-500"
+                >
+                  {isAnimating ? 'Animando...' : '▶ Reproducir'}
+                </button>
+              </div>
+            )}
+            <div className="grid grid-cols-2 gap-2 text-[10px] font-black uppercase tracking-wider">
+              <button onClick={() => refImageInputRef.current?.click()} className="rounded-xl bg-slate-800 px-2 py-2 text-slate-300 hover:bg-slate-700">Referencia</button>
+              <button onClick={() => imageInputRef.current?.click()} className="rounded-xl bg-slate-800 px-2 py-2 text-slate-300 hover:bg-slate-700">Imagen</button>
+              <button onClick={exportSVG} className="rounded-xl bg-slate-800 px-2 py-2 text-slate-300 hover:bg-slate-700">SVG</button>
+              <button onClick={exportJPG} className="rounded-xl bg-slate-800 px-2 py-2 text-slate-300 hover:bg-slate-700">JPG</button>
+              <button onClick={exportJSON} className="col-span-2 rounded-xl bg-slate-800 px-2 py-2 text-slate-300 hover:bg-slate-700">JSON</button>
+            </div>
+          </div>
+          </>
+          )}
           </div>
         </div>
 
-        {/* Gestor Flotante de Capas (Esquina inferior derecha) */}
-        <div className="absolute bottom-6 left-10 hidden xl:flex flex-col gap-2 p-3 bg-slate-900/95 backdrop-blur-md border border-slate-800 rounded-2xl shadow-xl w-60 z-20">
-          <div className="flex items-center justify-between pb-2 border-b border-slate-800">
-            <div className="flex items-center gap-2 text-xs font-black uppercase tracking-wider text-slate-400">
-              <Layers size={14} className="text-blue-400" />
-              <span>Panel de Capas</span>
-            </div>
-            <span className="text-[10px] text-emerald-400 font-bold">2 activas</span>
-          </div>
-
-          <div className="flex flex-col gap-1.5 mt-1">
-            {layers.map((layer) => (
-              <div
-                key={layer.id}
-                onClick={() => setActiveLayerId(layer.id)}
-                className={cn(
-                  "p-2 rounded-xl flex items-center justify-between text-xs cursor-pointer transition-all",
-                  activeLayerId === layer.id 
-                    ? "bg-blue-600/15 border border-blue-500/40 text-white font-semibold" 
-                    : "bg-slate-950/60 border border-slate-800 text-slate-400 hover:text-white"
-                )}
-              >
-                <div className="flex items-center gap-2">
-                  <div className={cn(
-                    "w-2.5 h-2.5 rounded-full",
-                    layer.type === 'ia_base' ? "bg-emerald-400" : "bg-blue-500"
-                  )} />
-                  <span className="truncate max-w-[120px]">{layer.name}</span>
-                </div>
-
-                <button
-                  type="button"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    toggleLayerVisibility(layer.id);
-                  }}
-                  className="p-1 hover:text-white text-slate-500 transition-colors"
-                  title={layer.visible ? "Ocultar Capa" : "Mostrar Capa"}
-                >
-                  {layer.visible ? <Eye size={14} /> : <EyeOff size={14} className="text-red-400" />}
-                </button>
-              </div>
-            ))}
-          </div>
+        <div className="absolute bottom-2 md:bottom-4 left-2 md:left-4 flex gap-2">
+          <span className="px-1.5 md:px-2 py-0.5 bg-black/50 backdrop-blur rounded text-[8px] md:text-[9px] font-bold text-white/60">Rueda: zoom · Alt+arrastre: pan · Flechas: mover</span>
         </div>
       </section>
     </div>

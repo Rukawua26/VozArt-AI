@@ -1,8 +1,23 @@
-import { Component, ErrorInfo, ReactNode } from 'react';
-import { createRoot } from 'react-dom/client';
+import {StrictMode, Component, ErrorInfo, ReactNode} from 'react';
+import {createRoot} from 'react-dom/client';
 import App from './App.tsx';
 import './index.css';
-import { AuthProvider } from './contexts/AuthContext';
+
+if ('serviceWorker' in navigator) {
+  if (window.location.hostname === 'localhost') {
+    window.addEventListener('load', () => {
+      navigator.serviceWorker.getRegistrations().then((registrations) => {
+        registrations.forEach((registration) => registration.unregister());
+      }).catch(() => undefined);
+    });
+  } else {
+    window.addEventListener('load', () => {
+      navigator.serviceWorker.register('/sw.js').catch((error) => {
+        console.error('No se pudo registrar el service worker:', error);
+      });
+    });
+  }
+}
 
 interface ErrorBoundaryProps {
   children: ReactNode;
@@ -14,40 +29,33 @@ interface ErrorBoundaryState {
 }
 
 class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundaryState> {
-  public props: ErrorBoundaryProps;
-  public state: ErrorBoundaryState = {
-    hasError: false,
-    error: null,
-  };
-
-  constructor(props: ErrorBoundaryProps) {
-    super(props);
-    this.props = props;
-  }
+  state: ErrorBoundaryState = { hasError: false, error: null };
 
   static getDerivedStateFromError(error: Error): ErrorBoundaryState {
     return { hasError: true, error };
   }
 
   componentDidCatch(error: Error, errorInfo: ErrorInfo) {
-    console.error("Error no controlado capturado en VozArt:", error, errorInfo);
+    console.error("Uncaught error:", error, errorInfo);
   }
 
   render() {
     if (this.state.hasError) {
       return (
-        <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col items-center justify-center p-6 text-center">
-          <div className="max-w-md p-6 bg-slate-900 border border-red-500/30 rounded-3xl shadow-2xl">
-            <h1 className="text-xl font-bold text-red-400 mb-2">Ocurrió un error en el lienzo</h1>
-            <p className="text-sm text-slate-400 mb-4">Se ha contenido el problema para proteger tu progreso.</p>
-            <pre className="p-3 bg-black/60 rounded-xl text-xs text-red-300 font-mono text-left overflow-auto max-h-40">
-              {this.state.error?.message || String(this.state.error)}
-            </pre>
+        <div className="h-screen bg-slate-950 flex items-center justify-center p-8">
+          <div className="max-w-md w-full bg-slate-900 rounded-2xl border border-slate-800 p-8 shadow-2xl text-center">
+            <div className="w-16 h-16 mx-auto mb-6 rounded-full bg-red-500/20 flex items-center justify-center">
+              <span className="text-red-400 text-3xl font-bold">!</span>
+            </div>
+            <h1 className="text-xl font-black text-white mb-2">Algo salió mal</h1>
+            <p className="text-sm text-slate-400 mb-6 font-mono">
+              {this.state.error?.message || 'Error inesperado'}
+            </p>
             <button
-              onClick={() => window.location.reload()}
-              className="mt-4 px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white text-xs font-bold rounded-xl transition-colors"
+              onClick={() => this.setState({ hasError: false, error: null })}
+              className="px-6 py-2.5 bg-blue-600 hover:bg-blue-500 text-white rounded-xl font-bold text-sm transition-colors"
             >
-              Recargar VozArt
+              Intentar de nuevo
             </button>
           </div>
         </div>
@@ -58,9 +66,9 @@ class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundaryState> {
 }
 
 createRoot(document.getElementById('root')!).render(
-  <ErrorBoundary>
-    <AuthProvider>
+  <StrictMode>
+    <ErrorBoundary>
       <App />
-    </AuthProvider>
-  </ErrorBoundary>,
+    </ErrorBoundary>
+  </StrictMode>,
 );
